@@ -134,7 +134,7 @@ ss::future<> controller::start(
       })
       .then([this, stored_cluster_uuid] {
           return _bootstrap_backend.start_single(
-            stored_cluster_uuid, std::ref(_storage));
+            stored_cluster_uuid, std::ref(_credentials), std::ref(_storage));
       })
       .then([this] {
           return _config_frontend.start(
@@ -463,6 +463,8 @@ ss::future<> controller::create_cluster() {
       "Cluster can only be created from controller_stm_shard");
     bootstrap_cluster_cmd_data cmd_data;
     cmd_data.uuid = model::cluster_uuid(uuid_t::create());
+    cmd_data.bootstrap_user_cred
+      = security_frontend::get_bootstrap_user_creds_from_env();
     vlog(clusterlog.info, "Creating cluster {}", cmd_data.uuid);
 
     for (simple_time_jitter<model::timeout_clock> retry_jitter(1s);;) {
@@ -531,13 +533,6 @@ controller::cluster_creation_hook(const bool local_node_is_seed_server) {
         while (!_raft0->is_leader()) {
             co_await ss::sleep(100ms);
         }
-
-        auto err
-          = co_await _security_frontend.local().maybe_create_bootstrap_user();
-        vassert(
-          err == errc::success,
-          "Controller write should always succeed in single replica state "
-          "during creation");
 
         co_return co_await create_cluster();
     }

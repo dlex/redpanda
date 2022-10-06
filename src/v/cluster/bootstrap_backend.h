@@ -37,7 +37,9 @@ namespace cluster {
 class bootstrap_backend final {
 public:
     bootstrap_backend(
-      const std::optional<model::cluster_uuid>&, ss::sharded<storage::api>&);
+      const std::optional<model::cluster_uuid>&,
+      ss::sharded<security::credential_store>&,
+      ss::sharded<storage::api>&);
 
     ss::future<std::error_code> apply_update(model::record_batch);
 
@@ -52,6 +54,7 @@ public:
 
 private:
     std::optional<model::cluster_uuid> _cluster_uuid;
+    ss::sharded<security::credential_store>& _credentials;
     ss::sharded<storage::api>& _storage;
 };
 
