@@ -19,6 +19,7 @@
 #include "cluster/bootstrap_service.h"
 #include "cluster/cluster_discovery.h"
 #include "cluster/cluster_utils.h"
+#include "cluster/cluster_uuid.h"
 #include "cluster/controller.h"
 #include "cluster/fwd.h"
 #include "cluster/id_allocator.h"
@@ -1401,10 +1402,17 @@ void application::wire_up_and_start(::stop_signal& app_signal) {
           std::make_optional<model::node_id>(node_id));
     }
 
-    vlog(_log.info, "Starting Redpanda with node_id {}", node_id);
+    const auto cluster_uuid = cluster::read_stored_cluster_uuid(
+      storage.local());
+
+    vlog(
+      _log.info,
+      "Starting Redpanda with node_id {}, cluster UUID {}",
+      node_id,
+      cluster_uuid);
 
     wire_up_runtime_services(node_id);
-    start_runtime_services(cd, app_signal);
+    start_runtime_services(app_signal, cd, cluster_uuid);
 
     if (_proxy_config) {
         _proxy.invoke_on_all(&pandaproxy::rest::proxy::start).get();
@@ -1431,8 +1439,9 @@ void application::wire_up_and_start(::stop_signal& app_signal) {
 }
 
 void application::start_runtime_services(
-  const cluster::cluster_discovery& cluster_discovery,
-  ::stop_signal& app_signal) {
+  ::stop_signal& app_signal,
+  const cluster::cluster_discovery& cd,
+  const std::optional<cluster::cluster_uuid>& stored_cluster_uuid) {
     // single instance
     node_status_backend.invoke_on_all(&cluster::node_status_backend::start)
       .get();
@@ -1451,7 +1460,9 @@ void application::start_runtime_services(
 
     syschecks::systemd_message("Starting controller").get();
     controller
-      ->start(cluster_discovery.initial_seed_brokers(true /*TODO:integrate*/))
+      ->start(
+        cd.initial_seed_brokers(stored_cluster_uuid.has_value()),
+        stored_cluster_uuid)
       .get0();
     kafka_group_migration = ss::make_lw_shared<kafka::group_metadata_migration>(
       *controller, group_router);
