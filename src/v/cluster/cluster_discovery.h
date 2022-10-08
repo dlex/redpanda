@@ -98,6 +98,8 @@ public:
     ss::future<brokers> initial_seed_brokers_if_no_cluster(
       const std::optional<model::cluster_uuid>& stored_cluster_uuid);
 
+    ss::future<bool> is_cluster_founder();
+
 private:
     // Sends requests to each seed server to register the local node UUID until
     // one succeeds. Upon success, sets `node_id` to the assigned node ID and

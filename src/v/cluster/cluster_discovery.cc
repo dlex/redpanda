@@ -135,6 +135,12 @@ cluster_discovery::initial_seed_brokers_if_no_cluster(
     co_return co_await initial_seed_brokers();
 }
 
+ss::future<bool> cluster_discovery::is_cluster_founder() {
+    const std::optional<model::node_id> cluster_founder_node_id
+      = co_await get_cluster_founder_node_id();
+    co_return cluster_founder_node_id.has_value();
+}
+
 ss::future<bool> cluster_discovery::dispatch_node_uuid_registration_to_seeds(
   model::node_id& assigned_node_id) {
     const auto& seed_servers = config::node().seed_servers();
