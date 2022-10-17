@@ -18,11 +18,12 @@ namespace cluster {
 const bytes cluster_uuid_key = "cluster_uuid";
 const storage::kvstore::key_space cluster_uuid_key_space
   = storage::kvstore::key_space::controller;
+constexpr ss::shard_id cluster_uuid_shard = ss::shard_id(0);
 
 std::optional<model::cluster_uuid>
 read_stored_cluster_uuid(storage::kvstore& kvstore) {
     vassert(
-      ss::this_shard_id() == ss::shard_id(0),
+      ss::this_shard_id() == cluster_uuid_shard,
       "Cluster UUID is only stored in shard 0");
     std::optional<iobuf> cluster_uuid_buf = kvstore.get(
       cluster_uuid_key_space, cluster_uuid_key);
@@ -33,10 +34,17 @@ read_stored_cluster_uuid(storage::kvstore& kvstore) {
     return {};
 }
 
+ss::future<std::optional<model::cluster_uuid>>
+read_stored_cluster_uuid_front(seastar::sharded<storage::api>& storage) {
+    return storage.invoke_on(cluster_uuid_shard, [](storage::api& storage) {
+        return read_stored_cluster_uuid(storage.kvs());
+    });
+}
+
 ss::future<> write_stored_cluster_uuid(
   storage::kvstore& kvstore, const model::cluster_uuid& value) {
     vassert(
-      ss::this_shard_id() == ss::shard_id(0),
+      ss::this_shard_id() == cluster_uuid_shard,
       "Cluster UUID is only stored in shard 0");
     return kvstore.put(
       cluster_uuid_key_space, cluster_uuid_key, serde::to_iobuf(value));

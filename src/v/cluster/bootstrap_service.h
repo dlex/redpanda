@@ -10,6 +10,7 @@
 
 #include "cluster/bootstrap_types.h"
 #include "cluster/cluster_bootstrap_service.h"
+#include "storage/fwd.h"
 
 #include <seastar/core/sharded.hh>
 
@@ -19,11 +20,18 @@ namespace cluster {
 // TODO: talk about how it's a slim service with few dependencies.
 class bootstrap_service : public cluster_bootstrap_service {
 public:
-    bootstrap_service(ss::scheduling_group sg, ss::smp_service_group ssg)
-      : cluster_bootstrap_service(sg, ssg) {}
+    bootstrap_service(
+      ss::scheduling_group sg,
+      ss::smp_service_group ssg,
+      ss::sharded<storage::api>& storage)
+      : cluster_bootstrap_service(sg, ssg)
+      , _storage(storage) {}
 
     ss::future<cluster_bootstrap_info_reply> cluster_bootstrap_info(
       cluster_bootstrap_info_request&&, rpc::streaming_context&) override;
+
+private:
+    ss::sharded<storage::api>& _storage;
 };
 
 } // namespace cluster
