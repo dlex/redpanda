@@ -11,7 +11,6 @@
 
 #include "cluster/bootstrap_types.h"
 #include "cluster/cluster_utils.h"
-#include "cluster/cluster_uuid.h"
 #include "cluster/logger.h"
 #include "config/node_config.h"
 #include "features/feature_table.h"
@@ -34,7 +33,7 @@ bootstrap_service::cluster_bootstrap_info(
       std::back_inserter(r.seed_servers),
       [](const config::seed_server& seed_server) { return seed_server.addr; });
     r.empty_seed_starts_cluster = config::node().empty_seed_starts_cluster();
-    r.cluster_uuid = co_await cluster::read_stored_cluster_uuid_front(_storage);
+    r.cluster_uuid = _storage.local().get_cluster_uuid();
 
     vlog(clusterlog.debug, "Replying cluster_bootstrap_info: {}", r);
     co_return r;

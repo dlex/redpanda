@@ -16,10 +16,10 @@
 #include "cloud_storage/cache_service.h"
 #include "cloud_storage/partition_recovery_manager.h"
 #include "cloud_storage/remote.h"
+#include "cluster/bootstrap_backend.h"
 #include "cluster/bootstrap_service.h"
 #include "cluster/cluster_discovery.h"
 #include "cluster/cluster_utils.h"
-#include "cluster/cluster_uuid.h"
 #include "cluster/controller.h"
 #include "cluster/fwd.h"
 #include "cluster/id_allocator.h"
@@ -1335,6 +1335,12 @@ void application::start_bootstrap_services() {
       .get();
 
     storage.invoke_on_all(&storage::api::start).get();
+    if (const auto& cluster_uuid
+        = cluster::bootstrap_backend::read_stored_cluster_uuid(
+          storage.local().kvs());
+        cluster_uuid) {
+        storage.local().set_cluster_uuid(*cluster_uuid);
+    }
 
     syschecks::systemd_message("Starting internal RPC bootstrap service").get();
     _rpc
@@ -1388,15 +1394,12 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
     wire_up_bootstrap_services();
     start_bootstrap_services();
 
-    const auto cluster_uuid = cluster::read_stored_cluster_uuid(
-      storage.local().kvs());
-
     // Begin the cluster discovery manager so we can determine our initial node
     // ID. A valid node ID is required before we can initialize the rest of our
     // subsystems.
     const auto& node_uuid = storage.local().node_uuid();
     cluster::cluster_discovery cd(
-      node_uuid, storage.local().kvs(), app_signal.abort_source());
+      node_uuid, storage.local(), app_signal.abort_source());
     auto node_id = cd.determine_node_id().get();
     if (config::node().node_id() == std::nullopt) {
         // If we previously didn't have a node ID, set it in the config. We
@@ -1411,7 +1414,7 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
       _log.info,
       "Starting Redpanda with node_id {}, cluster UUID {}",
       node_id,
-      cluster_uuid);
+      cd.stored_cluster_uuid());
 
     wire_up_runtime_services(node_id);
 
@@ -1426,7 +1429,7 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
           .get();
     }
 
-    start_runtime_services(app_signal, cd, cluster_uuid);
+    start_runtime_services(app_signal, cd);
 
     if (_proxy_config) {
         _proxy.invoke_on_all(&pandaproxy::rest::proxy::start).get();
@@ -1453,9 +1456,7 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
 }
 
 void application::start_runtime_services(
-  ::stop_signal& app_signal,
-  cluster::cluster_discovery& cd,
-  const std::optional<model::cluster_uuid>& stored_cluster_uuid) {
+  ::stop_signal& app_signal, cluster::cluster_discovery& cd) {
     ssx::background = _feature_table.invoke_on_all(
       [this](features::feature_table& ft) -> ss::future<> {
           try {
@@ -1499,8 +1500,7 @@ void application::start_runtime_services(
     // Initialize the Raft RPC endpoint before the rest of the runtime RPC
     // services so the cluster seeds can elect a leader and write a cluster
     // UUID before proceeding with the rest of bootstrap.
-    const bool start_raft_rpc_early = !stored_cluster_uuid.has_value()
-                                      && cd.is_cluster_founder().get();
+    const bool start_raft_rpc_early = cd.is_cluster_founder().get();
     if (start_raft_rpc_early) {
         syschecks::systemd_message("Starting RPC/raft").get();
         _rpc
@@ -1519,11 +1519,7 @@ void application::start_runtime_services(
           .get();
     }
     syschecks::systemd_message("Starting controller").get();
-    controller
-      ->start(
-        cd.initial_seed_brokers_if_no_cluster(stored_cluster_uuid).get(),
-        stored_cluster_uuid)
-      .get0();
+    controller->start(cd.initial_seed_brokers_if_no_cluster().get()).get0();
 
     kafka_group_migration = ss::make_lw_shared<kafka::group_metadata_migration>(
       *controller, group_router);

@@ -37,9 +37,7 @@ namespace cluster {
 class bootstrap_backend final {
 public:
     bootstrap_backend(
-      const std::optional<model::cluster_uuid>&,
-      ss::sharded<security::credential_store>&,
-      ss::sharded<storage::api>&);
+      ss::sharded<security::credential_store>&, ss::sharded<storage::api>&);
 
     ss::future<std::error_code> apply_update(model::record_batch);
 
@@ -48,12 +46,24 @@ public:
                == model::record_batch_type::cluster_bootstrap_cmd;
     }
 
-    const std::optional<model::cluster_uuid>& get_cluster_uuid() const {
-        return _cluster_uuid;
-    }
+    /**
+     * Read the stored cluster uuid from the kvstore
+     *
+     * \pre Called from shard0
+     * \return Cluster UUID if stored in kvstore, empty otherwise
+     */
+    static std::optional<model::cluster_uuid>
+    read_stored_cluster_uuid(storage::kvstore&);
+
+    /**
+     * Write cluster UUID to kvstore
+     *
+     * \pre Called from shard0
+     */
+    static ss::future<>
+    write_stored_cluster_uuid(storage::kvstore&, const model::cluster_uuid&);
 
 private:
-    std::optional<model::cluster_uuid> _cluster_uuid;
     ss::sharded<security::credential_store>& _credentials;
     ss::sharded<storage::api>& _storage;
 };

@@ -8,7 +8,6 @@
 // by the Apache License, Version 2.0
 #pragma once
 
-#include "cluster/cluster_uuid.h"
 #include "cluster/types.h"
 #include "model/fundamental.h"
 #include "serde/serde.h"

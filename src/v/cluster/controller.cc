@@ -100,9 +100,8 @@ ss::future<> controller::wire_up() {
       .then([this] { _probe.start(); });
 }
 
-ss::future<> controller::start(
-  std::vector<model::broker> initial_raft0_brokers,
-  const std::optional<model::cluster_uuid>& stored_cluster_uuid) {
+ss::future<>
+controller::start(std::vector<model::broker> initial_raft0_brokers) {
     const bool local_node_is_seed_server = !initial_raft0_brokers.empty();
     std::vector<model::node_id> seed_nodes;
     seed_nodes.reserve(initial_raft0_brokers.size());
@@ -140,9 +139,9 @@ ss::future<> controller::start(
       .then([this] {
           return _feature_backend.start_single(std::ref(_feature_table));
       })
-      .then([this, stored_cluster_uuid] {
+      .then([this] {
           return _bootstrap_backend.start_single(
-            stored_cluster_uuid, std::ref(_credentials), std::ref(_storage));
+            std::ref(_credentials), std::ref(_storage));
       })
       .then([this] {
           return _config_frontend.start(
@@ -511,7 +510,7 @@ ss::future<> controller::create_cluster() {
  */
 ss::future<>
 controller::cluster_creation_hook(const bool local_node_is_seed_server) {
-    if (_bootstrap_backend.local().get_cluster_uuid()) {
+    if (_storage.local().get_cluster_uuid()) {
         // Cluster already exists
         co_return;
     }
@@ -549,16 +548,15 @@ controller::cluster_creation_hook(const bool local_node_is_seed_server) {
 
     // The new cluster creation is done by the leader of raft0 consisting of
     // seed servers, once elected
-    while (!_bootstrap_backend.local().get_cluster_uuid()
-           && !_raft0->is_leader()) {
+    while (!_storage.local().get_cluster_uuid() && !_raft0->is_leader()) {
         co_await ss::sleep(100ms);
     }
 
-    if (_bootstrap_backend.local().get_cluster_uuid()) {
+    if (_storage.local().get_cluster_uuid()) {
         vlog(
           clusterlog.info,
           "Cluster is {}",
-          *_bootstrap_backend.local().get_cluster_uuid());
+          *_storage.local().get_cluster_uuid());
         co_return;
     }
 

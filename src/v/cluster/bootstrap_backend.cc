@@ -11,7 +11,6 @@
 
 #include "cluster/bootstrap_backend.h"
 
-#include "cluster/cluster_uuid.h"
 #include "cluster/commands.h"
 #include "cluster/logger.h"
 #include "cluster/types.h"
@@ -20,11 +19,9 @@
 namespace cluster {
 
 bootstrap_backend::bootstrap_backend(
-  const std::optional<model::cluster_uuid>& cluster_uuid,
   ss::sharded<security::credential_store>& credentials,
   ss::sharded<storage::api>& storage)
-  : _cluster_uuid(cluster_uuid)
-  , _credentials(credentials)
+  : _credentials(credentials)
   , _storage(storage) {}
 
 namespace {
@@ -75,12 +72,12 @@ bootstrap_backend::apply_update(model::record_batch b) {
 
     co_return co_await ss::visit(
       cmd, [this](bootstrap_cluster_cmd cmd) -> ss::future<std::error_code> {
-          if (_cluster_uuid.has_value()) {
+          if (_storage.local().get_cluster_uuid().has_value()) {
               vlog(
                 clusterlog.debug,
                 "Skipping bootstrap_cluster_cmd {}, current cluster_uuid: {}",
                 cmd.value.uuid,
-                *_cluster_uuid);
+                *_storage.local().get_cluster_uuid());
               co_return errc::cluster_already_exists;
           }
 
@@ -101,12 +98,45 @@ bootstrap_backend::apply_update(model::record_batch b) {
                 cmd.value.bootstrap_user_cred->username);
           }
 
-          _cluster_uuid = cmd.value.uuid;
+          co_await _storage.invoke_on_all(
+            [&new_cluster_uuid = cmd.value.uuid](storage::api& storage) {
+                storage.set_cluster_uuid(new_cluster_uuid);
+                return ss::make_ready_future();
+            });
+
           co_await write_stored_cluster_uuid(
             _storage.local().kvs(), cmd.value.uuid);
           vlog(clusterlog.info, "Cluster created {}", cmd.value.uuid);
           co_return errc::success;
       });
+}
+
+const bytes cluster_uuid_key = "cluster_uuid";
+const storage::kvstore::key_space cluster_uuid_key_space
+  = storage::kvstore::key_space::controller;
+constexpr ss::shard_id cluster_uuid_shard = ss::shard_id(0);
+
+/*static*/ std::optional<model::cluster_uuid>
+bootstrap_backend::read_stored_cluster_uuid(storage::kvstore& kvstore) {
+    vassert(
+      ss::this_shard_id() == cluster_uuid_shard,
+      "Cluster UUID is only stored in shard 0");
+    std::optional<iobuf> cluster_uuid_buf = kvstore.get(
+      cluster_uuid_key_space, cluster_uuid_key);
+    if (cluster_uuid_buf) {
+        return model::cluster_uuid{
+          serde::from_iobuf<uuid_t>(std::move(*cluster_uuid_buf))};
+    }
+    return {};
+}
+
+/*static*/ ss::future<> bootstrap_backend::write_stored_cluster_uuid(
+  storage::kvstore& kvstore, const model::cluster_uuid& value) {
+    vassert(
+      ss::this_shard_id() == cluster_uuid_shard,
+      "Cluster UUID is only stored in shard 0");
+    return kvstore.put(
+      cluster_uuid_key_space, cluster_uuid_key, serde::to_iobuf(value));
 }
 
 } // namespace cluster

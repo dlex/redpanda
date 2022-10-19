@@ -16,8 +16,8 @@
 
 namespace cluster {
 
-// RPC service to be used when initialially bootstrapping a cluster.
-// TODO: talk about how it's a slim service with few dependencies.
+// RPC service used when initialially bootstrapping a cluster, or dicovering
+// about a potentially existing cluster by a seed non-member
 class bootstrap_service : public cluster_bootstrap_service {
 public:
     bootstrap_service(

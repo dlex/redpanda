@@ -22,6 +22,7 @@
 
 namespace storage {
 class kvstore;
+class api;
 } // namespace storage
 
 namespace cluster {
@@ -65,9 +66,7 @@ public:
     using brokers = std::vector<model::broker>;
 
     cluster_discovery(
-      const model::node_uuid& node_uuid,
-      storage::kvstore& kvstore,
-      ss::abort_source&);
+      const model::node_uuid& node_uuid, storage::api&, ss::abort_source&);
 
     // Determines what the node ID for this node should be. Once called, we can
     // proceed with initializing anything that depends on node ID (Raft
@@ -95,10 +94,17 @@ public:
      */
     ss::future<brokers> initial_seed_brokers();
 
-    ss::future<brokers> initial_seed_brokers_if_no_cluster(
-      const std::optional<model::cluster_uuid>& stored_cluster_uuid);
+    ss::future<brokers> initial_seed_brokers_if_no_cluster();
 
+    /**
+     * Cluster founder is a node that is not a part of a cluster yet, and when
+     * started it should participate in a new cluster creation.
+     */
     ss::future<bool> is_cluster_founder();
+
+    const std::optional<model::cluster_uuid>& stored_cluster_uuid() const {
+        return _stored_cluster_uuid;
+    }
 
 private:
     // Sends requests to each seed server to register the local node UUID until
@@ -151,6 +157,7 @@ private:
     simple_time_jitter<model::timeout_clock> _join_retry_jitter;
     const std::chrono::milliseconds _join_timeout;
 
+    const std::optional<model::cluster_uuid> _stored_cluster_uuid;
     storage::kvstore& _kvstore;
     ss::abort_source& _as;
     std::vector<
