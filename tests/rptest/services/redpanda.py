@@ -2074,6 +2074,7 @@ class RedpandaService(Service):
             self.logger.info(
                 "Writing bootstrap cluster config file {}:{}".format(
                     node.name, RedpandaService.CLUSTER_BOOTSTRAP_CONFIG_FILE))
+            self.logger.debug(conf_yaml)
             node.account.mkdirs(
                 os.path.dirname(RedpandaService.CLUSTER_BOOTSTRAP_CONFIG_FILE))
             node.account.create_file(
