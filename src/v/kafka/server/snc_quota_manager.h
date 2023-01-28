@@ -33,6 +33,32 @@ struct ingress_egress_state {
     T eg;
 };
 
+class snc_quotas_probe {
+public:
+    snc_quotas_probe(class snc_quota_manager& qm) : _qm(qm) {}
+    snc_quotas_probe(const snc_quotas_probe&) = delete;
+    snc_quotas_probe& operator=(const snc_quotas_probe&) = delete;
+    snc_quotas_probe(snc_quotas_probe&&) = delete;
+    snc_quotas_probe& operator=(snc_quotas_probe&&) = delete;
+    ~snc_quotas_probe() noexcept = default;
+
+    void balancer_step() { ++_balancer_runs; }
+
+    void setup_metrics();
+    // void setup_public_metrics();
+
+    uint32_t get_balancer_runs() const noexcept { return _balancer_runs; }
+
+private:
+    class snc_quota_manager& _qm;
+    ss::metrics::metric_groups _metrics;
+    uint32_t _balancer_runs = 0;
+    // friend std::ostream&
+    // operator<<(std::ostream& o, const snc_quotas_probe& p);
+};
+
+/// Isolates \ref quota_manager functionality related to
+/// shard/node/cluster (SNC) wide quotas and limits
 class snc_quota_manager
   : public ss::peering_sharded_service<snc_quota_manager> {
 public:
@@ -70,6 +96,17 @@ public:
 
     void record_response_tp(
       size_t request_size, clock::time_point now = clock::now()) noexcept;
+
+    const snc_quotas_probe&
+    get_snc_quotas_probe() const noexcept {
+        return _probe;
+    };
+
+    /// Return current effective quota values
+    ingress_egress_state<quota_t> get_quota() const noexcept;
+
+    /// Return current measured throughput values
+    ingress_egress_state<quota_t> get_throughput() const noexcept;
 
 private:
     /// Describes an instruction to the balancer how to alter effective shard
@@ -120,9 +157,6 @@ private:
     /// get_deficiency() and get_surplus() will return actual data
     void refill_buckets(const clock::time_point now) noexcept;
 
-    /// Return current quota values
-    ingress_egress_state<quota_t> get_quota() const noexcept;
-
     /// If the current quota is sufficient for the shard, returns 0,
     /// otherwise returns a positive value
     ingress_egress_state<quota_t> get_deficiency() const noexcept;
@@ -155,12 +189,15 @@ private:
     ss::lowres_clock::time_point _balancer_timer_last_ran;
     ss::gate _balancer_gate;
     mutex _balancer_mx;
-    ingress_egress_state<quota_t> _node_deficit;
+    ingress_egress_state<quota_t> _node_deficit{0, 0};
 
     // operational, used on each shard
     ingress_egress_state<std::optional<quota_t>> _node_quota_default;
     ingress_egress_state<quota_t> _shard_quota_minimum;
     ingress_egress_state<bottomless_token_bucket> _shard_quota;
+
+    // service
+    snc_quotas_probe _probe;
 };
 
 } // namespace kafka

@@ -651,7 +651,7 @@ class RedpandaService(Service):
 
     def __init__(
             self,
-            context,
+            context: TestContext,
             num_brokers,
             *,
             extra_rp_conf=None,

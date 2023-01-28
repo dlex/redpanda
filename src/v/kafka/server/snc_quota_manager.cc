@@ -13,6 +13,8 @@
 #include "kafka/server/logger.h"
 #include "prometheus/prometheus_sanitize.h"
 
+#include <seastar/core/metrics.hh>
+
 #include <fmt/core.h>
 #include <fmt/ranges.h>
 
@@ -59,6 +61,72 @@ to_soa_layout(const std::vector<ingress_egress_state<T>>& v) {
 
 namespace {
 
+const auto direction_label = ss::metrics::label("direction");
+const auto label_ingress = direction_label("ingress");
+const auto label_egress = direction_label("egress");
+
+template<class T>
+void add_ingress_egress_gauges(
+  std::vector<ss::metrics::metric_definition>& metric_defs,
+  ss::metrics::metric_name_type name,
+  T&& value_getter,
+  ss::metrics::description desc,
+  const std::vector<ss::metrics::label>& aggregate_labels) {
+    metric_defs.emplace_back(ss::metrics::make_gauge(
+                               name,
+                               [value_getter] { return value_getter().in; },
+                               desc,
+                               {label_ingress})
+                               .aggregate(aggregate_labels));
+    metric_defs.emplace_back(ss::metrics::make_gauge(
+                               name,
+                               [value_getter] { return value_getter().eg; },
+                               desc,
+                               {label_egress})
+                               .aggregate(aggregate_labels));
+}
+
+}
+
+void snc_quotas_probe::setup_metrics() {
+    namespace sm = ss::metrics;
+
+    if (config::shard_local_cfg().disable_metrics()) {
+        return;
+    }
+
+    const auto aggregate_labels = config::shard_local_cfg().aggregate_metrics()
+                                    ? std::vector<sm::label>{sm::shard_label}
+                                    : std::vector<sm::label>{};
+    std::vector<ss::metrics::metric_definition> metric_defs;
+
+    if (ss::this_shard_id() == quota_balancer_shard) {
+        metric_defs.emplace_back(sm::make_counter(
+          "balancer_runs",
+          [this] { return _balancer_runs; },
+          sm::description(
+            "{}: Number of times throughput quota balancer has been run")));
+    }
+    add_ingress_egress_gauges(
+      metric_defs,
+      "quota_effective",
+      [this] { return _qm.get_quota(); },
+      sm::description("{}: Currently effective quota, in bytes/s"),
+      aggregate_labels);
+    add_ingress_egress_gauges(
+      metric_defs,
+      "throughput",
+      [this] { return _qm.get_throughput(); },
+      sm::description("{}: Throughput measurement at the time of last "
+                      "balancer run, in bytes/s"),
+      aggregate_labels);
+
+    _metrics.add_group(
+      prometheus_sanitize::metrics_name("kafka:quotas_snc"), metric_defs);
+}
+
+namespace {
+
 quota_t node_to_shard_quota(const std::optional<quota_t> node_quota) {
     if (node_quota.has_value()) {
         const quota_t v = node_quota.value() / ss::smp::count;
@@ -98,6 +166,7 @@ snc_quota_manager::snc_quota_manager()
            _kafka_quota_balancer_window()},
       .eg {node_to_shard_quota(_node_quota_default.eg),
            _kafka_quota_balancer_window()}}
+  , _probe(*this)
 {
     update_shard_quota_minimum();
     _kafka_throughput_limit_node_bps.in.watch(
@@ -133,6 +202,7 @@ snc_quota_manager::snc_quota_manager()
             });
         });
     }
+    _probe.setup_metrics();
     vlog(klog.debug, "qm - Initial quota: {}", _shard_quota);
 }
 
@@ -306,6 +376,7 @@ ss::future<> snc_quota_manager::quota_balancer_step() {
     _balancer_gate.check();
     _balancer_timer_last_ran = ss::lowres_clock::now();
     vlog(klog.trace, "qb - Step");
+    _probe.balancer_step();
 
     // determine the borrowers and whether any balancing is needed now
     const auto borrowers = co_await container().map(
@@ -390,7 +461,7 @@ ss::future<> snc_quota_manager::quota_balancer_step() {
     }
 }
 
-namespace {
+//namespace {
 
 /// Split \p value between the elements of vector \p target in full, adding them
 /// to the elements already in the vector.
@@ -430,7 +501,7 @@ quota_t cap_to_ceiling(quota_t& value, const quota_t limit) {
 /// \pre schedule.size() == surplus.size()
 void dispense_negative_deltas(
   std::vector<quota_t>& schedule,
-  quota_t& delta,
+  quota_t delta,
   const std::vector<quota_t>& surplus) {
     if (delta >= 0) {
         return;
@@ -438,16 +509,17 @@ void dispense_negative_deltas(
 
     const quota_t total_surplus = std::reduce(
       surplus.cbegin(), surplus.cend(), quota_t{0}, std::plus{});
-
     if (delta > -total_surplus) {
+
+        // distribute the delta between the shards pro rata to their surpluses
         quota_t remainder = delta;
-        // pro rata to surpluses
         for (size_t k = 0; k != ss::smp::count; ++k) {
             const quota_t share = muldiv(delta, surplus.at(k), total_surplus);
             schedule.at(k) += share;
             remainder -= share;
         }
-        // the remainder equally
+        // there may be some undistributed remainder left due to trunction,
+        // and it must be non-positive
         if (remainder > 0) {
             vlog(
               klog.error,
@@ -459,38 +531,33 @@ void dispense_negative_deltas(
               surplus);
             return;
         }
+        // distribute the remainder equally between the shards
         if (remainder < 0) {
-            const quota_t d = (remainder + 1)
-                                / static_cast<quota_t>(schedule.size())
-                              - 1;
+            // shard's share rounded to the floor (towards -inf)
+            const quota_t share = (remainder + 1)
+                                    / static_cast<quota_t>(schedule.size())
+                                  - 1;
             for (quota_t& s : schedule) {
-                const quota_t dd = std::max(d, remainder);
-                remainder -= dd;
-                s += dd;
+                const quota_t d = std::max(share, remainder);
+                remainder -= d;
+                s += d;
             }
         }
 
     } else { // delta <= -total_surplus
 
-        // all surpluses
+        // use the entire amount of surpluses of each shard towards the delta
         for (size_t k = 0; k != ss::smp::count; ++k) {
             const quota_t share = -surplus.at(k);
             schedule.at(k) += share;
             delta -= share;
         }
-        // the rest equally
-        auto share = std::div(delta, ss::smp::count);
-        for (quota_t& s : schedule) {
-            s += share.quot;
-            if (share.rem < 0) {
-                s += -1;
-                share.quot -= -1;
-            }
-        }
+        // distribure whatever is left in the delta equally between shards
+        dispense_equally ( schedule, delta );
     }
 }
 
-} // namespace
+//} // namespace
 
 ss::future<> snc_quota_manager::quota_balancer_update(
   ingress_egress_state<dispense_quota_amount> shard_quotas_update) {
@@ -513,7 +580,7 @@ ss::future<> snc_quota_manager::quota_balancer_update(
 
     // deliver deltas and try to dispense them fairly and in full
     ingress_egress_state<quota_t> deltas = {
-      .in = shard_quotas_update.in.get_delta_or_0(),
+      .in = shard_quotas_update.in.get_delta_or_0(), // -4'296'169'424
       .eg = shard_quotas_update.eg.get_delta_or_0()};
     if (is_zero(deltas)) {
         co_return;
@@ -524,16 +591,19 @@ ss::future<> snc_quota_manager::quota_balancer_update(
       std::vector<quota_t>(ss::smp::count)};
 
     if (deltas.in < 0 || deltas.eg < 0) {
-        // cap negative delta at -(total surrenderable quota),
-        // diff towards node deficit
+        // cap negative delta at -(total quota),
+        // difference between the required delta and the delta that can be
+        // acquired goes towards the node deficit
         const auto total_quota = co_await container().map_reduce0(
-          [](const snc_quota_manager& qm) {
-              return qm.get_quota() - qm._shard_quota_minimum;
-          },
+          [](const snc_quota_manager& qm) { return qm.get_quota(); },
           ingress_egress_state<quota_t>{0, 0},
           std::plus{});
-        _node_deficit.in += cap_to_ceiling(deltas.in, -total_quota.in);
+        vlog(klog.trace, "qb - Total quota: {}", total_quota); // 4'296'169'440
+        _node_deficit.in += cap_to_ceiling(deltas.in, -total_quota.in); // ->0
         _node_deficit.eg += cap_to_ceiling(deltas.eg, -total_quota.eg);
+        if (!is_zero(_node_deficit)) {
+            vlog(klog.debug, "qb - Node deficit: {}", _node_deficit); // 0
+        }
 
         const auto surplus_aos = co_await container().map(
           [](snc_quota_manager& qm) {
@@ -555,9 +625,9 @@ ss::future<> snc_quota_manager::quota_balancer_update(
     vlog(
       klog.debug,
       "qb - Dispense delta updates {} of {} as {}",
-      deltas,
+      deltas,                   // -14'836'650
       shard_quotas_update,
-      schedule);
+      schedule);                // -2'148'084'712
 
     co_await container().invoke_on_all([&schedule](snc_quota_manager& qm) {
         qm.adjust_quota(
@@ -589,6 +659,13 @@ snc_quota_manager::get_deficiency() const noexcept {
 
 ingress_egress_state<quota_t> snc_quota_manager::get_quota() const noexcept {
     return {.in = _shard_quota.in.quota(), .eg = _shard_quota.eg.quota()};
+}
+
+ingress_egress_state<quota_t>
+snc_quota_manager::get_throughput() const noexcept {
+    return {
+      .in = _shard_quota.in.quota() - _shard_quota.in.get_current_rate(),
+      .eg = _shard_quota.eg.quota() - _shard_quota.eg.get_current_rate()};
 }
 
 ingress_egress_state<quota_t> snc_quota_manager::get_surplus() const noexcept {
