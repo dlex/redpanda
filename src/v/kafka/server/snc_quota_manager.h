@@ -16,13 +16,17 @@
 #include "security/acl.h"
 #include "utils/bottomless_token_bucket.h"
 #include "utils/mutex.h"
+#include "outcome.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/net/inet_address.hh>
+
+#include <absl/container/flat_hash_map.h>
 
 #include <chrono>
 #include <optional>
@@ -64,6 +68,16 @@ private:
     size_t _traffic_in = 0;
 };
 
+// This is how the scope is associated with config::throughput_control_group.
+// The latter is unique if set, and the scopes for the named groups survive
+// configuration changes. Unnamed groups are referred by the index, and all such
+// scopes are reset on any change of groups configuration. std::monostate
+// denotes a scope that does not matches any group.
+using throughput_control_scope_key
+  = std::variant<std::monostate, ss::sstring, size_t>;
+
+struct throughput_control_scope;
+
 class snc_quota_context {
 public:
     snc_quota_context(
@@ -85,6 +99,13 @@ private:
     bool _exempt{false};
 
     // Operating
+
+    /// The scope object shared between multiple contexts
+    /// Key may not be present in the quota managers collection. This may be
+    /// a case when the context refers to an unnamed scope, and a configuration
+    /// change has eliminated all unnamed groups' scopes. A new scope is lazily
+    /// created then.
+    throughput_control_scope_key _scope_key;
 
     /// What time the client on this connection should throttle (be throttled)
     /// until
@@ -131,7 +152,7 @@ public:
       uint16_t client_port);
 
     /// Determine throttling required by shard level TP quotas.
-    delays_t get_shard_delays(snc_quota_context&, clock::time_point now) const;
+    delays_t get_shard_delays(snc_quota_context&, clock::time_point now);
 
     /// Record the request size when it has arrived from the transport.
     /// This should be done before calling \ref get_shard_delays because the
@@ -161,12 +182,20 @@ public:
     ingress_egress_state<quota_t> get_quota() const noexcept;
 
 private:
-    // Returns value based on upstream values, not the _node_quota_default
+    /// Get default node quota for the group if specified, or non-grouped if 
+    /// no group is specified. The return value is based on upstream values, 
+    /// not on the \ref _node_quota_default
     ingress_egress_state<std::optional<quota_t>>
-    calc_node_quota_default() const;
+    calc_node_quota_default(const config::throughput_control_group*) const;
 
-    // Uses the func above to update _node_quota_default and dependencies
-    void update_node_quota_default();
+    /// Uses the func above to update node_quota_default and dependencies
+    /// of the control scope. \p scope_hint must point to the scope object
+    /// specified by \p key, or be nullptr to be fetched from the dictionary
+    /// by the key.
+    void update_node_quota_default( 
+      const throughput_control_scope_key& key,
+      const throughput_control_scope* scope_hint = nullptr
+    );
 
     ss::lowres_clock::duration get_quota_balancer_node_period() const;
     void update_shard_quota_minimum();
@@ -208,6 +237,18 @@ private:
     /// Increase or decrease the current shard quota by the argument
     void adjust_quota(const ingress_egress_state<quota_t>& delta) noexcept;
 
+    enum class outcome_get_control_group {
+      no_index,
+      no_name,
+      unknown_key
+    };
+
+    result<const config::throughput_control_group*, outcome_get_control_group>
+    get_control_group(const throughput_control_scope_key&);
+
+    throughput_control_scope&
+    get_or_create_control_scope(const throughput_control_scope_key&);
+
 private:
     // configuration
     config::binding<std::chrono::milliseconds> _max_kafka_throttle_delay;
@@ -229,9 +270,9 @@ private:
     ingress_egress_state<quota_t> _node_deficit{0, 0};
 
     // operational, used on each shard
-    ingress_egress_state<std::optional<quota_t>> _node_quota_default;
     ingress_egress_state<quota_t> _shard_quota_minimum;
-    ingress_egress_state<bottomless_token_bucket> _shard_quota;
+    absl::flat_hash_map<throughput_control_scope_key, throughput_control_scope>
+      _scopes;
 
     // service
     snc_quotas_probe _probe;

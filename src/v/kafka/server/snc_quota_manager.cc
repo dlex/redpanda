@@ -10,18 +10,24 @@
 #include "kafka/server/snc_quota_manager.h"
 
 #include "config/configuration.h"
+#include "config/throughput_control_group.h"
 #include "kafka/server/logger.h"
+#include "likely.h"
 #include "prometheus/prometheus_sanitize.h"
 #include "tristate.h"
 
 #include <seastar/core/metrics.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sstring.hh>
 
 #include <fmt/core.h>
 #include <fmt/ranges.h>
 
+#include <cstddef>
 #include <iterator>
 #include <memory>
 #include <numeric>
+#include <variant>
 
 using namespace std::chrono_literals;
 
@@ -134,6 +140,35 @@ quota_t node_to_shard_quota(const std::optional<quota_t> node_quota) {
 
 } // namespace
 
+/// Operating data instance of throughput control group.
+/// Each quota context created for a connection is associated with an instance
+/// of control scope. Relations:
+/// throughput_control_group - 1:1 - throughput_control_scope
+/// snc_quota_context - n:1 - throughput_control_scope
+struct throughput_control_scope {
+    // Default node quota is the quota before intra-node balancer has kicked in
+    ingress_egress_state<std::optional<quota_t>> node_quota_default;
+
+    // Token buckets keeps two pieces of data: a share of the current effective
+    // quota, and the measure of current throughput
+    ingress_egress_state<bottomless_token_bucket> shard_quota;
+
+    // Count of references from quota contexts
+    size_t refcount = 0;
+
+    throughput_control_scope(
+      const ingress_egress_state<std::optional<quota_t>>& node_quota_default_,
+      const std::chrono::milliseconds kafka_quota_balancer_window)
+      : node_quota_default(node_quota_default_)
+      , shard_quota{
+          .in{
+            node_to_shard_quota(node_quota_default.in),
+            kafka_quota_balancer_window},
+          .eg{
+            node_to_shard_quota(node_quota_default.eg),
+            kafka_quota_balancer_window}} {}
+};
+
 snc_quota_manager::snc_quota_manager()
   : _max_kafka_throttle_delay(
     config::shard_local_cfg().max_kafka_throttle_delay_ms.bind())
@@ -151,24 +186,38 @@ snc_quota_manager::snc_quota_manager()
       config::shard_local_cfg()
         .kafka_quota_balancer_min_shard_throughput_bps.bind())
   , _kafka_throughput_control(config::shard_local_cfg().kafka_throughput_control.bind())
-  , _node_quota_default{calc_node_quota_default()}
-  , _shard_quota{
-      .in {node_to_shard_quota(_node_quota_default.in),
-           _kafka_quota_balancer_window()},
-      .eg {node_to_shard_quota(_node_quota_default.eg),
-           _kafka_quota_balancer_window()}}
+  // , _node_quota_default{calc_node_quota_default()}
+  // , _shard_quota{
+  //     .in {node_to_shard_quota(_node_quota_default.in),
+  //          _kafka_quota_balancer_window()},
+  //     .eg {node_to_shard_quota(_node_quota_default.eg),
+  //          _kafka_quota_balancer_window()}}
   , _probe(*this)
 {
     update_shard_quota_minimum();
+
     _kafka_throughput_limit_node_bps.in.watch(
-      [this] { update_node_quota_default(); });
-    _kafka_throughput_limit_node_bps.eg.watch(
-      [this] { update_node_quota_default(); });
+      [this] { update_node_quota_default({}); });
+    < --default group and scope _kafka_throughput_limit_node_bps.eg.watch(
+      [this] { update_node_quota_default({}); });
+    _kafka_throughput_control.watch([this] {
+        // delete unnamed group scopes, update named ones
+        for (auto i = _scopes.cbegin(); i != _scopes.cend();) {
+            if (std::holds_alternative<size_t>(i->first)) {
+                i = _scopes.erase(i);
+            } else {
+                update_node_quota_default(i->first, i->second);
+                < --scope `i` ++i;
+            }
+        }
+    });
     _kafka_quota_balancer_window.watch([this] {
         const auto v = _kafka_quota_balancer_window();
         vlog(klog.debug, "qm - Set shard TP token bucket window: {}", v);
-        _shard_quota.in.set_width(v);
-        _shard_quota.eg.set_width(v);
+        for (auto& s : _scopes) {
+            s.second.shard_quota.in.set_width(v);
+            s.second.shard_quota.eg.set_width(v);
+        }
     });
     _kafka_quota_balancer_node_period.watch([this] {
         if (_balancer_gate.is_closed()) {
@@ -182,7 +231,11 @@ snc_quota_manager::snc_quota_manager()
         // if the balancer is disabled, this is where the quotas are reset to
         // default. This needs to be called on every shard because the effective
         // balance is updated directly in this case.
-        update_node_quota_default();
+        for (auto& scope : _scopes) {
+            update_node_quota_default(scope.first, scope.second);
+            < --all scopes + default
+        }
+        update_node_quota_default({});
     });
     _kafka_quota_balancer_min_shard_throughput_ratio.watch(
       [this] { update_shard_quota_minimum(); });
@@ -198,7 +251,7 @@ snc_quota_manager::snc_quota_manager()
         });
     }
     _probe.setup_metrics();
-    vlog(klog.debug, "qm - Initial quota: {}", _shard_quota);
+    // vlog(klog.debug, "qm - Initial quotas: {}", _scopes);
 }
 
 ss::future<> snc_quota_manager::start() {
@@ -238,15 +291,23 @@ delay_t eval_delay(const bottomless_token_bucket& tb) noexcept {
 } // namespace
 
 ingress_egress_state<std::optional<quota_t>>
-snc_quota_manager::calc_node_quota_default() const {
+snc_quota_manager::calc_node_quota_default(
+  const config::throughput_control_group* const group) const {
     // here will be the code to merge node limit
     // and node share of cluster limit; so far it's node limit only
     // Ignore _shard_quota_minimum because it only applies when quotas
     // are adjusted during balancing
     const ingress_egress_state<std::optional<quota_t>> default_quota{
-      .in = _kafka_throughput_limit_node_bps.in(),
-      .eg = _kafka_throughput_limit_node_bps.eg()};
-    vlog(klog.trace, "qm - Default node TP quotas: {}", default_quota);
+      .in = group ? group->throughput_limit_node_in_bps
+                  : _kafka_throughput_limit_node_bps.in(),
+      .eg = group ? group->throughput_limit_node_out_bps
+                  : _kafka_throughput_limit_node_bps.eg()};
+    vlog(
+      klog.trace,
+      "qm - Default node TP quotas for {}: {}",
+      group ? (group->is_noname() ? "(an unnamed group)" : group->name)
+            : "(default)",
+      default_quota);
     return default_quota;
 }
 
@@ -343,7 +404,7 @@ void snc_quota_manager::get_or_create_quota_context(
 }
 
 snc_quota_manager::delays_t snc_quota_manager::get_shard_delays(
-  snc_quota_context& ctx, const clock::time_point now) const {
+  snc_quota_context& ctx, const clock::time_point now) {
     delays_t res;
 
     // force throttle whatever the client did not do on its side
@@ -353,9 +414,11 @@ snc_quota_manager::delays_t snc_quota_manager::get_shard_delays(
 
     // throttling delay the connection should be requested to throttle
     // this time
+    auto& scope = get_throughput_control_scope(ctx._scope_key);
     res.request = std::min(
       _max_kafka_throttle_delay(),
-      std::max(eval_delay(_shard_quota.in), eval_delay(_shard_quota.eg)));
+      std::max(
+        eval_delay(scope.shard_quota.in), eval_delay(scope.shard_quota.eg)));
     ctx._throttled_until = now + res.request;
 
     return res;
@@ -368,7 +431,8 @@ void snc_quota_manager::record_request_receive(
     if (ctx._exempt) {
         return;
     }
-    _shard_quota.in.use(request_size, now);
+    get_throughput_control_scope(ctx._scope_key)
+      .shard_quota.in.use(request_size, now);
 }
 
 void snc_quota_manager::record_request_intake(
@@ -386,7 +450,8 @@ void snc_quota_manager::record_response(
     if (ctx._exempt) {
         return;
     }
-    _shard_quota.eg.use(request_size, now);
+    get_throughput_control_scope(ctx._scope_key)
+      .shard_quota.eg.use(request_size, now);
 }
 
 ss::lowres_clock::duration
@@ -400,15 +465,21 @@ snc_quota_manager::get_quota_balancer_node_period() const {
     return v;
 }
 
-void snc_quota_manager::update_node_quota_default() {
+void snc_quota_manager::update_node_quota_default(
+  const throughput_control_scope_key& key,
+  const throughput_control_scope* scope) {
+    if (!scope) {
+        scope = &get_throughput_control_scope(key);
+    }
+
     const ingress_egress_state<std::optional<quota_t>> new_node_quota_default
       = calc_node_quota_default();
-    if (ss::this_shard_id() == quota_balancer_shard) {
+    < --group if (ss::this_shard_id() == quota_balancer_shard) {
         ingress_egress_state<std::optional<quota_t>> qold;
         if (_kafka_quota_balancer_node_period() == 0ms) {
             // set effective shard quotas to default shard quotas only if
             // the balancer is off. This resets all the uneven distribution of
-            // effective quotas done by the balancer to the uniform  default
+            // effective quotas done by the balancer to the uniform default
             // once the balancer is turned off, like if the node default quota
             // were not enabled
             qold = {std::nullopt, std::nullopt};
@@ -417,17 +488,20 @@ void snc_quota_manager::update_node_quota_default() {
             // and distributed between the shards synchronously to balancer runs
             // based on both old and new values for the default node quota
             qold = _node_quota_default;
+            < --scope
         }
 
         // dependent update: effective shard quotas
         ssx::spawn_with_gate(
           _balancer_gate, [this, qold, qnew = new_node_quota_default] {
               return quota_balancer_update(qold, qnew);
+              < --scope
           });
     }
     _node_quota_default = new_node_quota_default;
-    // dependent update: shard minimum quota
-    update_shard_quota_minimum();
+    < --scope
+      // dependent update: shard minimum quota
+      update_shard_quota_minimum();
 }
 
 void snc_quota_manager::update_shard_quota_minimum() {
@@ -816,8 +890,10 @@ ss::future<> snc_quota_manager::quota_balancer_update(
 }
 
 void snc_quota_manager::refill_buckets(const clock::time_point now) noexcept {
-    _shard_quota.in.refill(now);
-    _shard_quota.eg.refill(now);
+    for (auto& s : _scopes) {
+        s.second.shard_quota.in.refill(now);
+        s.second.shard_quota.eg.refill(now);
+    }
 }
 
 ingress_egress_state<quota_t>
@@ -884,6 +960,96 @@ void snc_quota_manager::adjust_quota(
     f(_shard_quota.in, delta.in, "in");
     f(_shard_quota.eg, delta.eg, "eg");
     vlog(klog.trace, "qm - Adjust quota: {} -> {}", delta, _shard_quota);
+}
+
+result<const config::throughput_control_group*, outcome_get_control_group>
+snc_quota_manager::get_control_group(const throughput_control_scope_key& key) {
+    if (std::holds_alternative<std::monostate>(key)) {
+        // default (no group)
+        return nullptr;
+    }
+
+    if (std::holds_alternative<size_t>(key)) {
+        // unnamed control group
+        const size_t idx = std::get<size_t>(key);
+        if (unlikely(idx >= _kafka_throughput_control().size())) {
+            return outcome_get_control_group::no_index;
+        }
+        return &_kafka_throughput_control[idx];
+    }
+
+    if (std::holds_alternative<ss::sstring>(key)) {
+        // named group
+        // an index over node names can make it faster, but this branch is
+        // expected to engage only once per connection lifetime, so no early
+        // optimization
+        auto group_it = std::find_if(
+          _kafka_throughput_control().cbegin(),
+          _kafka_throughput_control().cend(),
+          [group_name = std::get<ss::sstring>(key)](
+            const config::throughput_control_group& group) {
+              return !group.is_noname() && group.name == group_name;
+          });
+        if (unlikely(group_it == _kafka_throughput_control().cend())) {
+            return outcome_get_control_group::no_name;
+        }
+        return &*group_it;
+    }
+
+    vlog(klog.error, "qm - unknown group key {}", key);
+    return outcome_get_control_group::unknown_key;
+}
+
+throughput_control_scope& snc_quota_manager::get_throughput_control_scope(
+  const throughput_control_scope_key& key) {
+    if (auto scope_it = _scopes.find(key); likely(scope_it != _scopes.end())) {
+        return scope_it->second;
+    }
+
+    // scope does not exist, initialize it lazily
+    // the group is needed for that
+    const config::throughput_control_group* const group = get_control_group(
+      key);
+
+    if (std::holds_alternative<std::monostate>(key)) {
+        // init default (non-group) scope using global properties
+    }
+    else if (std::holds_alternative<size_t>(key)) {
+        // init unnamed control group scope
+        if (unlikely(!group)) {
+            vlog(
+              klog.error,
+              "qm - requested group index {} out of bounds, "
+              "using default group scope",
+              key);
+            return get_throughput_control_scope({});
+        }
+    }
+    else if (std::holds_alternative<ss::sstring>(key)) {
+        // init named group scope
+        if (unlikely(!group)) {
+            vlog(
+              klog.error,
+              "qm - requested group name {} not found, "
+              "using default group scope",
+              key);
+            return get_throughput_control_scope({});
+        }
+    }
+    else {
+        vlog(
+          klog.error,
+          "qm - unknown group key {}, using default group scope",
+          key);
+        return get_throughput_control_scope({});
+    }
+
+    auto emplaced = _scopes.emplace(
+      key,
+      throughput_control_scope(
+        calc_node_quota_default(group), _kafka_quota_balancer_window()));
+    vlog(klog.trace, "qm - new group scope: {}", key, emplaced.first);
+    return emplaced.first->second;    
 }
 
 } // namespace kafka
